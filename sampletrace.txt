@@ -1,0 +1,49 @@
+POST /api/auth/login HTTP/1.1
+Host: example.com
+Content-Type: application/json
+Authorization: Basic dXNlcm5hbWU6cGFzc3dvcmQ=
+User-Agent: Fiddler/5.0
+{
+    "username": "testuser@example.com",
+    "password": "P@ssw0rd123"
+}
+HTTP/1.1 200 OK
+Content-Type: application/json
+Set-Cookie: sessionid=abcdef123456; HttpOnly
+{
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.fakeAccessTokenPayload",
+    "refresh_token": "eyJhbGciOiJIUzI1NiJ9.fakeRefreshTokenPayload",
+    "expires_in": 3600
+}
+GET /api/user/profile HTTP/1.1
+Host: example.com
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.fakeAccessTokenPayload
+User-Agent: Fiddler/5.0
+HTTP/1.1 200 OK
+Content-Type: application/json
+{
+    "user_id": "12345",
+    "username": "testuser@example.com",
+    "email": "testuser@example.com",
+    "roles": ["admin", "user"]
+	IP 192.168.22.24
+}
+POST /api/auth/refresh HTTP/1.1
+Host: example.com
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.fakeRefreshTokenPayload
+User-Agent: Fiddler/5.0
+{
+    "refresh_token": "eyJhbGciOiJIUzI1NiJ9.fakeRefreshTokenPayload"
+	{
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.newFakeAccessTokenPayload",
+    "expires_in": 3600
+}
+{
+    "user_id": "12345",
+    "username": "bobdavid@example.com",
+    "email": "bobdavid@example.com",
+    "roles": ["admin", "user"]
+	IP 192.168.22.24
+}
+}
