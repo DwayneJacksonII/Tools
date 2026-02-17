@@ -18,7 +18,7 @@
     This method assumes Install-SCCMClient.ps1 already uploaded to Azure Blob Storage with a valid SAS token for access. 
 .DESCRIPTION
     Downloads SCCM client from Azure Blob Storage and installs.
-    Client will install but NOT register with management point (no connectivity lab testing deployment script logic).
+    Client will install but NOT register with management point (Lab no connectivity to SCCM Sever testing deployment script logic only).
 #>
 
 #region Configuration - MODIFY THESE
@@ -162,4 +162,5 @@ try {
 }
 
 #endregion
+
 
