@@ -15,7 +15,6 @@
 <#
 .SYNOPSIS
     SCCM Client Installation for Azure VMs (Azure Blob Method). 
-    This will not register with the management point
     This method assumes Install-SCCMClient.ps1 already uploaded to Azure Blob Storage with a valid SAS token for access. 
 .DESCRIPTION
     Downloads SCCM client from Azure Blob Storage and installs.
@@ -163,3 +162,4 @@ try {
 }
 
 #endregion
+
