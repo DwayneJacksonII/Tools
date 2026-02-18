@@ -25,7 +25,7 @@
 #region Configuration - MODIFY THESE
 $SiteCode = "PS1" # Your SCCM SITE CODE HERE (e.g., "PS1", "LAB")
 # Below BlobURL will use your_BLOB_URL_HERE with a SAS token that has read permissions and is valid
-$BlobURL = "https://sccmlab2024.blob.core.windows.net/sccm/SCCMClient.zip?sp=r&st=2026-02-17T04:50:17Z&se=2026-02-17T13:05:17Z&spr=https&sv=2024-11-04&sr=b&sig=1n%2FCKVKf5E4YlfInz4dydGQK61hwvDECOfe8hKpRBfE%3D"  
+$BlobURL = "Your_BLOB_URL_HERE"  
 $LocalPath = "C:\Temp\SCCMClient"   # UNC path to SCCCM Client source files
 $LogPath = "C:\Windows\Temp\SCCMInstall.log" # Installation log location on the Azure Windows VM
 #endregion
@@ -163,6 +163,7 @@ try {
 }
 
 #endregion
+
 
 
 
