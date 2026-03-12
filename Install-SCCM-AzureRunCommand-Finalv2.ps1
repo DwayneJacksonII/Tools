@@ -28,15 +28,15 @@
 # ============================================================
 
 # -- SOURCE TYPE: Choose one of "AzureBlob", "UNCPath", "LocalPath"
-$Config_SourceType = "AzureBlob"
+$Config_SourceType = "UNCPath"
 
 # -- AZURE BLOB (used when SourceType = "AzureBlob")
 #    Full direct-file SAS URL to the ZIP (sr=b, not sr=c)
-$Config_AzureBlobURL = "https://sccmlab2024.blob.core.windows.net/sccm/SCCMClient.zip?sp=r&st=2026-02-26T17:38:20Z&se=2026-02-27T01:53:20Z&spr=https&sv=2024-11-04&sr=b&sig=SlhzfPzoHdSKEwKKaTcQw%2FVbGyIhmv9c5hN3N9yPqCA%3D"
+$Config_AzureBlobURL = ""
 
 # -- UNC FILE SHARE (used when SourceType = "UNCPath")
 #    Path to folder containing ccmsetup.exe  e.g. \\fileserver\sccm\client
-$Config_UNCPath          = ""       # e.g. \\NC-SCCM\SMSSMS\Client
+$Config_UNCPath          = ""       # e.g. \\VM1-SCCM\SMSSMS\Client
 $Config_UNCUsername      = ""       # e.g. CONTOSO\svcSCCM   (leave blank if no creds needed)
 $Config_UNCPassword      = ""       # plain text (or use a keyvault reference in pipeline)
 
@@ -47,16 +47,16 @@ $Config_LocalPath = ""              # e.g. C:\SCCMClient  or  D:\Tools\SCCM
 # ============================================================
 # SCCM SITE & MANAGEMENT POINT
 # ============================================================
-$Config_SiteCode        = "L24"
-$Config_ManagementPoint = "NC-SCCM.NC9245.lab"   # leave blank to install without MP
+$Config_SiteCode        = "" # use SCCM site code example L24
+$Config_ManagementPoint = ""    # leave blank to install without MP
 $Config_RegisterClient  = $true
 
 # ============================================================
 # PKI CERTIFICATE (optional)
 # ============================================================
-$Config_UsePKI       = $false
-$Config_CertTemplate = ""           # e.g. "SCCM Client"  -- leave blank if not using PKI
-
+$Config_UsePKI       = $false       # Must be set to true if set to $Config_UsePKI = $false, the script goes straight to the else branch — it logs "PKI not configured - using HTTP" and moves on. No certificate search, no registry lookup, no template matching
+$Config_CertTemplate = ""           # e.g. "Autoenrollment"  -- leave blank if not using PKI if using PKI provide template name example "Autoenrollment"
+#
 # ============================================================
 # DO NOT EDIT BELOW THIS LINE
 # ============================================================
@@ -492,3 +492,4 @@ if (Get-PSDrive -Name "SCCMShare" -ErrorAction SilentlyContinue) {
 }
 
 if ($ResultStatus -eq "FAILED") { exit 1 } else { exit 0 }
+
