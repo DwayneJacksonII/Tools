@@ -29,9 +29,41 @@
     - Assessment/Discovery and Replication appliance types
     - Public endpoint and Private Link connectivity
     - Proxy and firewall detection and reporting
+    - Non-interactive mode when all parameters are provided
+    - JSON structured output for automation/integration
+
+.PARAMETER Cloud
+    Azure cloud environment: Commercial (public) or Government.
+    If not specified, prompts interactively.
+
+.PARAMETER Scenario
+    Deployment scenario: VMwareAgentless, AgentBasedLegacy, or AgentBasedModern.
+    If not specified, prompts interactively.
+
+.PARAMETER ApplianceType
+    Appliance type: Assessment or Replication.
+    If not specified, prompts interactively.
+
+.PARAMETER PrivateLink
+    Switch to indicate private link / private endpoint connectivity.
+
+.PARAMETER OutputFormat
+    Report format: Text (default) or JSON. JSON generates an additional machine-readable report file.
+
+.EXAMPLE
+    .\Invoke-AzMigrateConnectivityCheck.ps1
+    Runs interactively with menu prompts.
+
+.EXAMPLE
+    .\Invoke-AzMigrateConnectivityCheck.ps1 -Cloud Commercial -Scenario VMwareAgentless -ApplianceType Assessment
+    Runs non-interactively with specified parameters.
+
+.EXAMPLE
+    .\Invoke-AzMigrateConnectivityCheck.ps1 -Cloud Government -Scenario AgentBasedModern -ApplianceType Replication -PrivateLink -OutputFormat JSON
+    Runs non-interactively for Gov cloud with private link and JSON output.
 
 .NOTES
-    Version:  1.0
+    Version:  1.1
     Requires: PowerShell 5.1+
     Author:   Azure Migrate Connectivity Checker (generated diagnostic tool)
 
@@ -41,7 +73,21 @@
 #>
 
 [CmdletBinding()]
-param()
+param(
+    [ValidateSet('Commercial','Government')]
+    [string]$Cloud,
+
+    [ValidateSet('VMwareAgentless','AgentBasedLegacy','AgentBasedModern')]
+    [string]$Scenario,
+
+    [ValidateSet('Assessment','Replication')]
+    [string]$ApplianceType,
+
+    [switch]$PrivateLink,
+
+    [ValidateSet('Text','JSON')]
+    [string]$OutputFormat = 'Text'
+)
 
 # ============================================================================
 # CONFIGURATION
@@ -51,10 +97,14 @@ $ProgressPreference    = 'SilentlyContinue'
 $script:TestResults    = [System.Collections.ArrayList]::new()
 $script:Recommendations = [System.Collections.ArrayList]::new()
 $script:Warnings       = [System.Collections.ArrayList]::new()
-$script:ScriptVersion  = '1.0'
+$script:ScriptVersion  = '1.1'
 $script:TcpTimeoutMs   = 5000
 $script:HttpTimeoutMs   = 10000
-$script:ReportPath     = Join-Path $PSScriptRoot ("AzMigrate-ConnectivityReport_{0}.txt" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+$script:OutputFormat   = $OutputFormat
+$script:BoundParams    = $PSBoundParameters
+$basePath = if ($PSScriptRoot) { $PSScriptRoot } else { $PWD.Path }
+$script:ReportPath     = Join-Path $basePath ("AzMigrate-ConnectivityReport_{0}.txt" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+$script:JsonReportPath = Join-Path $basePath ("AzMigrate-ConnectivityReport_{0}.json" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 
 # Force TLS 1.2 (required by Azure services)
 try {
@@ -114,9 +164,9 @@ function Get-MenuSelection {
     }
     Write-Host ""
     do {
-        $input = Read-Host "  Enter selection (1-$($Options.Count))"
+        $userChoice = Read-Host "  Enter selection (1-$($Options.Count))"
         $sel = 0
-        $valid = [int]::TryParse($input, [ref]$sel) -and $sel -ge 1 -and $sel -le $Options.Count
+        $valid = [int]::TryParse($userChoice, [ref]$sel) -and $sel -ge 1 -and $sel -le $Options.Count
         if (-not $valid) {
             Write-Host "  Invalid selection. Please enter a number between 1 and $($Options.Count)." -ForegroundColor Red
         }
@@ -135,6 +185,7 @@ function Test-TcpPort {
         LatencyMs  = -1
         Error      = ''
     }
+    $client = $null
     try {
         $client = New-Object System.Net.Sockets.TcpClient
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -151,31 +202,41 @@ function Test-TcpPort {
                 $result.Error = "Connection timed out after ${TimeoutMs}ms"
             }
         }
-        $client.Close()
-        $client.Dispose()
     } catch {
         $result.Error = $_.Exception.Message
+    } finally {
+        if ($client) { $client.Dispose() }
     }
     return $result
 }
 
 function Test-DnsResolution {
-    param([string]$HostName)
+    param(
+        [string]$HostName,
+        [int]$MaxRetries = 1
+    )
     $result = @{
         Success   = $false
         Addresses = @()
         Error     = ''
     }
-    try {
-        $addresses = [System.Net.Dns]::GetHostAddresses($HostName)
-        if ($addresses.Count -gt 0) {
-            $result.Success   = $true
-            $result.Addresses = $addresses | ForEach-Object { $_.IPAddressToString }
-        } else {
-            $result.Error = "No addresses returned"
+    for ($attempt = 0; $attempt -le $MaxRetries; $attempt++) {
+        try {
+            $addresses = [System.Net.Dns]::GetHostAddresses($HostName)
+            if ($addresses.Count -gt 0) {
+                $result.Success   = $true
+                $result.Addresses = $addresses | ForEach-Object { $_.IPAddressToString }
+                $result.Error     = ''
+                return $result
+            } else {
+                $result.Error = "No addresses returned"
+            }
+        } catch {
+            $result.Error = $_.Exception.Message
         }
-    } catch {
-        $result.Error = $_.Exception.Message
+        if ($attempt -lt $MaxRetries) {
+            Start-Sleep -Milliseconds 500
+        }
     }
     return $result
 }
@@ -301,7 +362,8 @@ function Get-UrlDefinitions {
                     @{ Host='portal.azure.com';       Port=443; Purpose='Azure portal';                     Wildcard='*.portal.azure.com' }
                     @{ Host='login.microsoftonline.com'; Port=443; Purpose='Azure AD authentication';       Wildcard='login.microsoftonline.com' }
                     @{ Host='login.windows.net';      Port=443; Purpose='Azure AD authentication (alt)';    Wildcard='login.windows.net' }
-                    @{ Host='graph.windows.net';      Port=443; Purpose='Azure AD Graph';                   Wildcard='*.windows.net' }
+                    @{ Host='graph.windows.net';      Port=443; Purpose='Azure AD Graph (legacy)';          Wildcard='*.windows.net' }
+                    @{ Host='graph.microsoft.com';    Port=443; Purpose='Microsoft Graph';                  Wildcard='graph.microsoft.com' }
                     @{ Host='management.azure.com';   Port=443; Purpose='Azure Resource Manager';           Wildcard='management.azure.com' }
                     @{ Host='dc.services.visualstudio.com'; Port=443; Purpose='Application Insights telemetry'; Wildcard='*.services.visualstudio.com' }
                     @{ Host='vault.azure.net';        Port=443; Purpose='Azure Key Vault';                  Wildcard='*.vault.azure.net' }
@@ -333,42 +395,36 @@ function Get-UrlDefinitions {
             }
 
             if ($ApplianceType -eq 'Replication') {
+                # Shared base URLs for agent-based replication (legacy and modern)
+                $agentBasedBaseUrls = @(
+                    @{ Host='hypervrecoverymanager.windowsazure.com'; Port=443; Purpose='Azure Recovery Services'; Wildcard='*.hypervrecoverymanager.windowsazure.com' }
+                    @{ Host='management.azure.com';   Port=443; Purpose='Azure Resource Manager'; Wildcard='management.azure.com' }
+                    @{ Host='login.microsoftonline.com'; Port=443; Purpose='Azure AD authentication'; Wildcard='login.microsoftonline.com' }
+                    @{ Host='blob.core.windows.net';  Port=443; Purpose='Azure Blob Storage (replication data)'; Wildcard='*.blob.core.windows.net' }
+                    @{ Host='backup.windowsazure.com'; Port=443; Purpose='Azure Backup service'; Wildcard='*.backup.windowsazure.com' }
+                    @{ Host='aka.ms';                 Port=443; Purpose='Microsoft URL redirect service'; Wildcard='aka.ms' }
+                    @{ Host='download.microsoft.com'; Port=443; Purpose='Microsoft downloads'; Wildcard='download.microsoft.com' }
+                    @{ Host='dc.services.visualstudio.com'; Port=443; Purpose='Application Insights telemetry'; Wildcard='*.services.visualstudio.com' }
+                    @{ Host='portal.azure.com';       Port=443; Purpose='Azure portal'; Wildcard='*.portal.azure.com' }
+                    @{ Host='login.windows.net';      Port=443; Purpose='Azure AD authentication (alt)'; Wildcard='login.windows.net' }
+                )
+
                 if ($Scenario -eq 'AgentBasedLegacy') {
-                    # Agent-based legacy replication appliance
-                    $legacyReplUrls = @(
-                        @{ Host='hypervrecoverymanager.windowsazure.com'; Port=443; Purpose='Azure Recovery Services'; Wildcard='*.hypervrecoverymanager.windowsazure.com' }
-                        @{ Host='management.azure.com';   Port=443; Purpose='Azure Resource Manager'; Wildcard='management.azure.com' }
-                        @{ Host='login.microsoftonline.com'; Port=443; Purpose='Azure AD authentication'; Wildcard='login.microsoftonline.com' }
-                        @{ Host='blob.core.windows.net';  Port=443; Purpose='Azure Blob Storage (replication data)'; Wildcard='*.blob.core.windows.net' }
-                        @{ Host='backup.windowsazure.com'; Port=443; Purpose='Azure Backup service'; Wildcard='*.backup.windowsazure.com' }
-                        @{ Host='aka.ms';                 Port=443; Purpose='Microsoft URL redirect service'; Wildcard='aka.ms' }
-                        @{ Host='download.microsoft.com'; Port=443; Purpose='Microsoft downloads'; Wildcard='download.microsoft.com' }
-                        @{ Host='dc.services.visualstudio.com'; Port=443; Purpose='Application Insights telemetry'; Wildcard='*.services.visualstudio.com' }
-                        @{ Host='portal.azure.com';       Port=443; Purpose='Azure portal'; Wildcard='*.portal.azure.com' }
-                        @{ Host='login.windows.net';      Port=443; Purpose='Azure AD authentication (alt)'; Wildcard='login.windows.net' }
-                    )
-                    foreach ($u in $legacyReplUrls) {
+                    foreach ($u in $agentBasedBaseUrls) {
                         [void]$urls.Add(@{ Host=$u.Host; Port=$u.Port; Purpose=$u.Purpose; Wildcard=$u.Wildcard; Category='Agent-Based Legacy Replication' })
                     }
                 }
 
                 if ($Scenario -eq 'AgentBasedModern') {
-                    # Agent-based modern replication appliance
-                    $modernReplUrls = @(
-                        @{ Host='hypervrecoverymanager.windowsazure.com'; Port=443; Purpose='Azure Recovery Services'; Wildcard='*.hypervrecoverymanager.windowsazure.com' }
-                        @{ Host='management.azure.com';   Port=443; Purpose='Azure Resource Manager'; Wildcard='management.azure.com' }
-                        @{ Host='login.microsoftonline.com'; Port=443; Purpose='Azure AD authentication'; Wildcard='login.microsoftonline.com' }
-                        @{ Host='blob.core.windows.net';  Port=443; Purpose='Azure Blob Storage (replication data)'; Wildcard='*.blob.core.windows.net' }
-                        @{ Host='backup.windowsazure.com'; Port=443; Purpose='Azure Backup service'; Wildcard='*.backup.windowsazure.com' }
-                        @{ Host='aka.ms';                 Port=443; Purpose='Microsoft URL redirect service'; Wildcard='aka.ms' }
-                        @{ Host='download.microsoft.com'; Port=443; Purpose='Microsoft downloads'; Wildcard='download.microsoft.com' }
-                        @{ Host='dc.services.visualstudio.com'; Port=443; Purpose='Application Insights telemetry'; Wildcard='*.services.visualstudio.com' }
-                        @{ Host='portal.azure.com';       Port=443; Purpose='Azure portal'; Wildcard='*.portal.azure.com' }
-                        @{ Host='login.windows.net';      Port=443; Purpose='Azure AD authentication (alt)'; Wildcard='login.windows.net' }
+                    foreach ($u in $agentBasedBaseUrls) {
+                        [void]$urls.Add(@{ Host=$u.Host; Port=$u.Port; Purpose=$u.Purpose; Wildcard=$u.Wildcard; Category='Agent-Based Modern Replication' })
+                    }
+                    # Modern-specific endpoints
+                    $modernExtras = @(
                         @{ Host='azure-devices.net';      Port=443; Purpose='Azure IoT Hub (modern appliance)'; Wildcard='*.azure-devices.net' }
                         @{ Host='prod.migration.windowsazure.com'; Port=443; Purpose='Modern migration service'; Wildcard='*.prod.migration.windowsazure.com' }
                     )
-                    foreach ($u in $modernReplUrls) {
+                    foreach ($u in $modernExtras) {
                         [void]$urls.Add(@{ Host=$u.Host; Port=$u.Port; Purpose=$u.Purpose; Wildcard=$u.Wildcard; Category='Agent-Based Modern Replication' })
                     }
                 }
@@ -420,7 +476,8 @@ function Get-UrlDefinitions {
                 $govAssessmentUrls = @(
                     @{ Host='portal.azure.us';        Port=443; Purpose='Azure Government portal';          Wildcard='*.portal.azure.us' }
                     @{ Host='login.microsoftonline.us'; Port=443; Purpose='Azure AD authentication (Gov)';  Wildcard='login.microsoftonline.us' }
-                    @{ Host='graph.windows.net';      Port=443; Purpose='Azure AD Graph';                   Wildcard='graph.windows.net' }
+                    @{ Host='graph.windows.net';      Port=443; Purpose='Azure AD Graph (legacy)';          Wildcard='graph.windows.net' }
+                    @{ Host='graph.microsoft.com';    Port=443; Purpose='Microsoft Graph';                  Wildcard='graph.microsoft.com' }
                     @{ Host='management.usgovcloudapi.net'; Port=443; Purpose='Azure Resource Manager (Gov)'; Wildcard='management.usgovcloudapi.net' }
                     @{ Host='dc.applicationinsights.us'; Port=443; Purpose='Application Insights (Gov)';    Wildcard='dc.applicationinsights.us' }
                     @{ Host='vault.usgovcloudapi.net'; Port=443; Purpose='Azure Key Vault (Gov)';           Wildcard='*.vault.usgovcloudapi.net' }
@@ -441,42 +498,40 @@ function Get-UrlDefinitions {
 
             if ($ApplianceType -eq 'Replication' -or $Scenario -eq 'VMwareAgentless') {
                 if ($Scenario -eq 'VMwareAgentless') {
-                    [void]$urls.Add(@{ Host='azure-devices.net'; Port=443; Purpose='Azure IoT Hub - migration gateway (Gov)'; Wildcard='*.azure-devices.net'; Category='VMware Agentless Migration (Gov)' })
+                    [void]$urls.Add(@{ Host='azure-devices.us'; Port=443; Purpose='Azure IoT Hub - migration gateway (Gov)'; Wildcard='*.azure-devices.us'; Category='VMware Agentless Migration (Gov)' })
                 }
             }
 
             if ($ApplianceType -eq 'Replication') {
+                # Shared base URLs for Gov agent-based replication (legacy and modern)
+                $govAgentBaseUrls = @(
+                    @{ Host='hypervrecoverymanager.windowsazure.us'; Port=443; Purpose='Recovery Services (Gov)'; Wildcard='*.hypervrecoverymanager.windowsazure.us' }
+                    @{ Host='management.usgovcloudapi.net';  Port=443; Purpose='ARM (Gov)'; Wildcard='management.usgovcloudapi.net' }
+                    @{ Host='login.microsoftonline.us';      Port=443; Purpose='Azure AD (Gov)'; Wildcard='login.microsoftonline.us' }
+                    @{ Host='blob.core.usgovcloudapi.net';   Port=443; Purpose='Blob Storage (Gov)'; Wildcard='*.blob.core.usgovcloudapi.net' }
+                    @{ Host='backup.windowsazure.us';        Port=443; Purpose='Backup service (Gov)'; Wildcard='*.backup.windowsazure.us' }
+                    @{ Host='aka.ms';                        Port=443; Purpose='URL redirect'; Wildcard='aka.ms' }
+                    @{ Host='download.microsoft.com';        Port=443; Purpose='Downloads'; Wildcard='download.microsoft.com' }
+                    @{ Host='dc.applicationinsights.us';     Port=443; Purpose='App Insights (Gov)'; Wildcard='dc.applicationinsights.us' }
+                    @{ Host='portal.azure.us';               Port=443; Purpose='Azure Gov portal'; Wildcard='*.portal.azure.us' }
+                )
+
                 if ($Scenario -eq 'AgentBasedLegacy') {
-                    $govLegacyUrls = @(
-                        @{ Host='hypervrecoverymanager.windowsazure.us'; Port=443; Purpose='Recovery Services (Gov)'; Wildcard='*.hypervrecoverymanager.windowsazure.us' }
-                        @{ Host='management.usgovcloudapi.net';  Port=443; Purpose='ARM (Gov)'; Wildcard='management.usgovcloudapi.net' }
-                        @{ Host='login.microsoftonline.us';      Port=443; Purpose='Azure AD (Gov)'; Wildcard='login.microsoftonline.us' }
-                        @{ Host='blob.core.usgovcloudapi.net';   Port=443; Purpose='Blob Storage (Gov)'; Wildcard='*.blob.core.usgovcloudapi.net' }
-                        @{ Host='backup.windowsazure.us';        Port=443; Purpose='Backup service (Gov)'; Wildcard='*.backup.windowsazure.us' }
-                        @{ Host='aka.ms';                        Port=443; Purpose='URL redirect'; Wildcard='aka.ms' }
-                        @{ Host='download.microsoft.com';        Port=443; Purpose='Downloads'; Wildcard='download.microsoft.com' }
-                        @{ Host='dc.applicationinsights.us';     Port=443; Purpose='App Insights (Gov)'; Wildcard='dc.applicationinsights.us' }
-                        @{ Host='portal.azure.us';               Port=443; Purpose='Azure Gov portal'; Wildcard='*.portal.azure.us' }
-                    )
-                    foreach ($u in $govLegacyUrls) {
+                    foreach ($u in $govAgentBaseUrls) {
                         [void]$urls.Add(@{ Host=$u.Host; Port=$u.Port; Purpose=$u.Purpose; Wildcard=$u.Wildcard; Category='Agent-Based Legacy Replication (Gov)' })
                     }
                 }
+
                 if ($Scenario -eq 'AgentBasedModern') {
-                    $govModernUrls = @(
-                        @{ Host='hypervrecoverymanager.windowsazure.us'; Port=443; Purpose='Recovery Services (Gov)'; Wildcard='*.hypervrecoverymanager.windowsazure.us' }
-                        @{ Host='management.usgovcloudapi.net';  Port=443; Purpose='ARM (Gov)'; Wildcard='management.usgovcloudapi.net' }
-                        @{ Host='login.microsoftonline.us';      Port=443; Purpose='Azure AD (Gov)'; Wildcard='login.microsoftonline.us' }
-                        @{ Host='blob.core.usgovcloudapi.net';   Port=443; Purpose='Blob Storage (Gov)'; Wildcard='*.blob.core.usgovcloudapi.net' }
-                        @{ Host='backup.windowsazure.us';        Port=443; Purpose='Backup service (Gov)'; Wildcard='*.backup.windowsazure.us' }
-                        @{ Host='aka.ms';                        Port=443; Purpose='URL redirect'; Wildcard='aka.ms' }
-                        @{ Host='download.microsoft.com';        Port=443; Purpose='Downloads'; Wildcard='download.microsoft.com' }
-                        @{ Host='dc.applicationinsights.us';     Port=443; Purpose='App Insights (Gov)'; Wildcard='dc.applicationinsights.us' }
-                        @{ Host='portal.azure.us';               Port=443; Purpose='Azure Gov portal'; Wildcard='*.portal.azure.us' }
-                        @{ Host='azure-devices.net';             Port=443; Purpose='IoT Hub (modern)'; Wildcard='*.azure-devices.net' }
+                    foreach ($u in $govAgentBaseUrls) {
+                        [void]$urls.Add(@{ Host=$u.Host; Port=$u.Port; Purpose=$u.Purpose; Wildcard=$u.Wildcard; Category='Agent-Based Modern Replication (Gov)' })
+                    }
+                    # Modern-specific Gov endpoints
+                    $govModernExtras = @(
+                        @{ Host='azure-devices.us';              Port=443; Purpose='IoT Hub (modern - Gov)'; Wildcard='*.azure-devices.us' }
                         @{ Host='prod.migration.windowsazure.us'; Port=443; Purpose='Modern migration service (Gov)'; Wildcard='*.prod.migration.windowsazure.us' }
                     )
-                    foreach ($u in $govModernUrls) {
+                    foreach ($u in $govModernExtras) {
                         [void]$urls.Add(@{ Host=$u.Host; Port=$u.Port; Purpose=$u.Purpose; Wildcard=$u.Wildcard; Category='Agent-Based Modern Replication (Gov)' })
                     }
                 }
@@ -489,7 +544,8 @@ function Get-UrlDefinitions {
             $govPrivateLinkUrls = @(
                 @{ Host='portal.azure.us';        Port=443; Purpose='Azure Government portal';          Wildcard='*.portal.azure.us' }
                 @{ Host='login.microsoftonline.us'; Port=443; Purpose='Azure AD (Gov)';                 Wildcard='login.microsoftonline.us' }
-                @{ Host='graph.windows.net';      Port=443; Purpose='Azure AD Graph';                   Wildcard='graph.windows.net' }
+                @{ Host='graph.windows.net';      Port=443; Purpose='Azure AD Graph (legacy)';          Wildcard='graph.windows.net' }
+                @{ Host='graph.microsoft.com';    Port=443; Purpose='Microsoft Graph';                  Wildcard='graph.microsoft.com' }
                 @{ Host='management.usgovcloudapi.net'; Port=443; Purpose='ARM (Gov)';                  Wildcard='management.usgovcloudapi.net' }
                 @{ Host='dc.applicationinsights.us'; Port=443; Purpose='App Insights (Gov)';            Wildcard='dc.applicationinsights.us' }
                 @{ Host='vault.usgovcloudapi.net'; Port=443; Purpose='Key Vault (Gov)';                 Wildcard='*.vault.usgovcloudapi.net' }
@@ -508,7 +564,7 @@ function Get-UrlDefinitions {
             }
 
             if ($Scenario -eq 'AgentBasedModern' -or $Scenario -eq 'VMwareAgentless') {
-                [void]$urls.Add(@{ Host='azure-devices.net'; Port=443; Purpose='IoT Hub (modern/agentless)'; Wildcard='*.azure-devices.net'; Category='Private Link - Modern/Agentless (Gov)' })
+                [void]$urls.Add(@{ Host='azure-devices.us'; Port=443; Purpose='IoT Hub (modern/agentless - Gov)'; Wildcard='*.azure-devices.us'; Category='Private Link - Modern/Agentless (Gov)' })
             }
         }
     }
@@ -524,7 +580,7 @@ function Get-UrlDefinitions {
         }
     }
 
-    return $dedupedUrls
+    return ,$dedupedUrls
 }
 
 # ============================================================================
@@ -736,7 +792,7 @@ function Test-BasicConnectivity {
     $dnsTest = Test-DnsResolution -HostName 'www.microsoft.com'
     $tcpTest = Test-TcpPort -HostName 'www.microsoft.com' -Port 443
     if ($dnsTest.Success -and $tcpTest.Success) {
-        Write-Host "    [PASS] DNS and TCP/443 to www.microsoft.com succeeded (${($tcpTest.LatencyMs)}ms)" -ForegroundColor Green
+        Write-Host "    [PASS] DNS and TCP/443 to www.microsoft.com succeeded ($($tcpTest.LatencyMs)ms)" -ForegroundColor Green
     } elseif (-not $dnsTest.Success) {
         Write-Host "    [FAIL] Cannot resolve www.microsoft.com - DNS resolution failed" -ForegroundColor Red
         Write-Host "           Error: $($dnsTest.Error)" -ForegroundColor Red
@@ -751,11 +807,11 @@ function Test-BasicConnectivity {
     Write-SubSection "TLS 1.2 Handshake Test"
     $httpsResult = Test-HttpsConnectivity -Url 'www.microsoft.com'
     if ($httpsResult.Success) {
-        Write-Host "    [PASS] HTTPS/TLS handshake to www.microsoft.com succeeded (HTTP $($httpsResult.StatusCode), ${($httpsResult.LatencyMs)}ms)" -ForegroundColor Green
+        Write-Host "    [PASS] HTTPS/TLS handshake to www.microsoft.com succeeded (HTTP $($httpsResult.StatusCode), $($httpsResult.LatencyMs)ms)" -ForegroundColor Green
         if ($httpsResult.CertIssuer) {
             Write-Host "    Certificate Issuer: $($httpsResult.CertIssuer)" -ForegroundColor Gray
             # Check for SSL inspection
-            if ($httpsResult.CertIssuer -notmatch 'Microsoft|DigiCert|Baltimore|GlobalSign|Symantec|GeoTrust|Comodo|Let.s Encrypt|Sectigo') {
+            if ($httpsResult.CertIssuer -notmatch 'Microsoft|DigiCert|Baltimore|GlobalSign|Symantec|GeoTrust|Comodo|Let.s Encrypt|Sectigo|Entrust|AffirmTrust|IdenTrust|ISRG') {
                 Write-Host "    [WARN] Certificate issuer may indicate SSL inspection / MITM proxy" -ForegroundColor Yellow
                 [void]$script:Warnings.Add("SSL inspection detected (cert issuer: $($httpsResult.CertIssuer)). This may interfere with Azure Migrate.")
                 [void]$script:Recommendations.Add(@"
@@ -781,14 +837,14 @@ function Test-LocalFirewall {
 
     try {
         $fwProfiles = Get-NetFirewallProfile -ErrorAction SilentlyContinue
-        foreach ($profile in $fwProfiles) {
-            $status = if ($profile.Enabled) { "Enabled" } else { "Disabled" }
-            $color  = if ($profile.Enabled) { "Yellow" } else { "Gray" }
-            Write-Host "    $($profile.Name) Profile: $status (Default Outbound: $($profile.DefaultOutboundAction))" -ForegroundColor $color
-            if ($profile.Enabled -and $profile.DefaultOutboundAction -eq 'Block') {
-                [void]$script:Warnings.Add("Windows Firewall '$($profile.Name)' profile has default outbound action set to BLOCK. This will block Azure Migrate unless explicit allow rules exist.")
+        foreach ($fwProfile in $fwProfiles) {
+            $status = if ($fwProfile.Enabled) { "Enabled" } else { "Disabled" }
+            $color  = if ($fwProfile.Enabled) { "Yellow" } else { "Gray" }
+            Write-Host "    $($fwProfile.Name) Profile: $status (Default Outbound: $($fwProfile.DefaultOutboundAction))" -ForegroundColor $color
+            if ($fwProfile.Enabled -and $fwProfile.DefaultOutboundAction -eq 'Block') {
+                [void]$script:Warnings.Add("Windows Firewall '$($fwProfile.Name)' profile has default outbound action set to BLOCK. This will block Azure Migrate unless explicit allow rules exist.")
                 [void]$script:Recommendations.Add(@"
-FIREWALL OUTBOUND BLOCK: The Windows Firewall $($profile.Name) profile is set to block outbound
+FIREWALL OUTBOUND BLOCK: The Windows Firewall $($fwProfile.Name) profile is set to block outbound
 traffic by default. Ensure outbound rules exist to allow TCP/443 to Azure Migrate endpoints.
 This is a LOCAL firewall issue (not network/corporate firewall).
 "@)
@@ -829,6 +885,7 @@ function Invoke-ConnectivityTests {
         $host_ = $entry.Host
         $port  = $entry.Port
         $pct   = [math]::Round(($currentIndex / $totalCount) * 100)
+        Write-Progress -Activity "Testing Azure Migrate Endpoints" -Status "[$currentIndex/$totalCount] $($host_):$port" -PercentComplete $pct
 
         Write-Host "    [$currentIndex/$totalCount] Testing $($host_):$port ... " -NoNewline -ForegroundColor White
 
@@ -881,6 +938,7 @@ function Invoke-ConnectivityTests {
             -HttpsPass $httpsPass -HttpsDetail $httpsDetail `
             -Category $entry.Category
     }
+    Write-Progress -Activity "Testing Azure Migrate Endpoints" -Completed
 }
 
 # ============================================================================
@@ -1266,6 +1324,59 @@ function Export-Report {
     }
 }
 
+function Export-JsonReport {
+    param(
+        [string]$Cloud,
+        [string]$Scenario,
+        [string]$ApplianceType,
+        [bool]$PrivateLink,
+        [bool]$ProxyDetected
+    )
+
+    $report = [ordered]@{
+        GeneratedAt    = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        ScriptVersion  = $script:ScriptVersion
+        Machine        = $env:COMPUTERNAME
+        Configuration  = [ordered]@{
+            Cloud          = $Cloud
+            Scenario       = $Scenario
+            ApplianceType  = $ApplianceType
+            PrivateLink    = $PrivateLink
+            ProxyDetected  = $ProxyDetected
+        }
+        Summary        = [ordered]@{
+            TotalEndpoints = $script:TestResults.Count
+            Passed         = @($script:TestResults | Where-Object { $_.OverallPass }).Count
+            Failed         = @($script:TestResults | Where-Object { -not $_.OverallPass }).Count
+        }
+        Results        = @($script:TestResults | ForEach-Object {
+            [ordered]@{
+                Url         = $_.Url
+                Port        = $_.Port
+                Purpose     = $_.Purpose
+                Category    = $_.Category
+                Wildcard    = $_.WildcardPattern
+                DnsPass     = $_.DnsPass
+                DnsDetail   = $_.DnsDetail
+                TcpPass     = $_.TcpPass
+                TcpDetail   = $_.TcpDetail
+                HttpsPass   = $_.HttpsPass
+                HttpsDetail = $_.HttpsDetail
+                OverallPass = $_.OverallPass
+            }
+        })
+        Warnings        = @($script:Warnings)
+        Recommendations = @($script:Recommendations)
+    }
+
+    try {
+        $report | ConvertTo-Json -Depth 5 | Out-File -FilePath $script:JsonReportPath -Encoding UTF8 -Force
+        Write-Host "  JSON report saved to: $($script:JsonReportPath)" -ForegroundColor Green
+    } catch {
+        Write-Host "  Failed to save JSON report: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
 # ============================================================================
 # PRIVATE LINK DNS VALIDATION
 # ============================================================================
@@ -1381,66 +1492,82 @@ function Main {
         return
     }
 
-    # ----- User Prompts -----
-    Write-Section "DEPLOYMENT SCENARIO SELECTION"
+    # Determine if running non-interactively (all required params provided via command line)
+    $isInteractive = -not ($script:BoundParams.ContainsKey('Cloud') -and
+                           $script:BoundParams.ContainsKey('Scenario') -and
+                           $script:BoundParams.ContainsKey('ApplianceType'))
 
-    $cloudSel = Get-MenuSelection -Prompt "Which Azure cloud are you deploying to?" `
-        -Options @("Commercial Azure (Public Cloud)", "Azure Government") `
-        -HelpText "Select the Azure cloud environment for your deployment."
-    $cloud = if ($cloudSel -eq 1) { 'Commercial' } else { 'Government' }
+    if ($isInteractive) {
+        # ----- Interactive User Prompts -----
+        Write-Section "DEPLOYMENT SCENARIO SELECTION"
 
-    $scenarioSel = Get-MenuSelection -Prompt "Which deployment scenario are you using?" `
-        -Options @(
-            "Azure Migrate VMware Agentless (discovery, assessment, and agentless migration)",
-            "Azure Migrate Agent-based Legacy Appliance (replication appliance)",
-            "Azure Migrate Agent-based Modern Appliance (simplified experience)"
-        ) `
-        -HelpText "See: https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance#deployment-scenarios"
-    $scenario = switch ($scenarioSel) {
-        1 { 'VMwareAgentless' }
-        2 { 'AgentBasedLegacy' }
-        3 { 'AgentBasedModern' }
+        $cloudSel = Get-MenuSelection -Prompt "Which Azure cloud are you deploying to?" `
+            -Options @("Commercial Azure (Public Cloud)", "Azure Government") `
+            -HelpText "Select the Azure cloud environment for your deployment."
+        $cloud = if ($cloudSel -eq 1) { 'Commercial' } else { 'Government' }
+
+        $scenarioSel = Get-MenuSelection -Prompt "Which deployment scenario are you using?" `
+            -Options @(
+                "Azure Migrate VMware Agentless (discovery, assessment, and agentless migration)",
+                "Azure Migrate Agent-based Legacy Appliance (replication appliance)",
+                "Azure Migrate Agent-based Modern Appliance (simplified experience)"
+            ) `
+            -HelpText "See: https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance#deployment-scenarios"
+        $scenario = switch ($scenarioSel) {
+            1 { 'VMwareAgentless' }
+            2 { 'AgentBasedLegacy' }
+            3 { 'AgentBasedModern' }
+        }
+
+        $applianceTypeSel = Get-MenuSelection -Prompt "What type of appliance are you troubleshooting?" `
+            -Options @(
+                "Assessment / Discovery appliance",
+                "Replication appliance (migration)"
+            ) `
+            -HelpText "Assessment appliance is for discovery and assessment. Replication appliance is for migration."
+        $applianceType = if ($applianceTypeSel -eq 1) { 'Assessment' } else { 'Replication' }
+
+        $privateLinkSel = Get-MenuSelection -Prompt "Are you using Azure Private Link / Private Endpoints?" `
+            -Options @("No (public connectivity)", "Yes (private endpoints)") `
+            -HelpText "See: https://learn.microsoft.com/en-us/azure/migrate/how-to-use-azure-migrate-with-private-endpoints"
+        $privateLink = $privateLinkSel -eq 2
+    } else {
+        # Non-interactive mode: use command-line parameters
+        $cloud         = $script:BoundParams['Cloud']
+        $scenario      = $script:BoundParams['Scenario']
+        $applianceType = $script:BoundParams['ApplianceType']
+        $privateLink   = [bool]$script:BoundParams['PrivateLink']
+        Write-Host "  Running in non-interactive mode with provided parameters." -ForegroundColor Cyan
     }
-
-    $applianceTypeSel = Get-MenuSelection -Prompt "What type of appliance are you troubleshooting?" `
-        -Options @(
-            "Assessment / Discovery appliance",
-            "Replication appliance (migration)"
-        ) `
-        -HelpText "Assessment appliance is for discovery and assessment. Replication appliance is for migration."
-    $applianceType = if ($applianceTypeSel -eq 1) { 'Assessment' } else { 'Replication' }
-
-    $privateLinkSel = Get-MenuSelection -Prompt "Are you using Azure Private Link / Private Endpoints?" `
-        -Options @("No (public connectivity)", "Yes (private endpoints)") `
-        -HelpText "See: https://learn.microsoft.com/en-us/azure/migrate/how-to-use-azure-migrate-with-private-endpoints"
-    $privateLink = $privateLinkSel -eq 2
 
     # ----- Custom URLs (error messages, auto-update endpoints, etc.) -----
     $customUrls = [System.Collections.ArrayList]::new()
-    Write-Host ""
-    Write-Host "  Do you have any specific URLs from error messages that you want to test?" -ForegroundColor White
-    Write-Host "  (e.g., auto-update manifest URLs, service endpoints from appliance errors)" -ForegroundColor Gray
-    Write-Host "  Paste full URL(s) one per line. Press Enter on a blank line when done." -ForegroundColor Gray
-    Write-Host "  (If none, just press Enter to continue)" -ForegroundColor Gray
-    Write-Host ""
-    do {
-        $customInput = Read-Host "  URL"
-        if ($customInput -and $customInput.Trim()) {
-            $trimmed = $customInput.Trim()
-            # Strip protocol prefix and trailing slashes to extract hostname
-            $hostPart = $trimmed -replace '^https?://' , '' -replace '/.*$', ''
-            if ($hostPart) {
-                [void]$customUrls.Add(@{
-                    Host     = $hostPart
-                    Port     = 443
-                    Purpose  = "Custom URL from error/appliance (source: $trimmed)"
-                    Wildcard = "*.$($hostPart -replace '^[^.]+\.', '')"
-                    Category = 'Custom URLs (from error messages)'
-                })
-                Write-Host "    Added: $hostPart" -ForegroundColor Green
+    if ($isInteractive) {
+        Write-Host ""
+        Write-Host "  Do you have any specific URLs from error messages that you want to test?" -ForegroundColor White
+        Write-Host "  (e.g., auto-update manifest URLs, service endpoints from appliance errors)" -ForegroundColor Gray
+        Write-Host "  Paste full URL(s) one per line. Press Enter on a blank line when done." -ForegroundColor Gray
+        Write-Host "  (If none, just press Enter to continue)" -ForegroundColor Gray
+        Write-Host ""
+        do {
+            $customInput = Read-Host "  URL"
+            if ($customInput -and $customInput.Trim()) {
+                $trimmed = $customInput.Trim()
+                # Strip protocol prefix and trailing slashes to extract hostname
+                $hostPart = $trimmed -replace '^https?://' , '' -replace '/.*$', ''
+                if ($hostPart) {
+                    [void]$customUrls.Add(@{
+                        Host     = $hostPart
+                        Port     = 443
+                        Purpose  = "Custom URL from error/appliance (source: $trimmed)"
+                        Wildcard = "*.$($hostPart -replace '^[^.]+\.', '')"
+                        Category = 'Custom URLs (from error messages)'
+                    })
+                    Write-Host "    Added: $hostPart" -ForegroundColor Green
+                }
             }
-        }
-    } while ($customInput -and $customInput.Trim())
+        } while ($customInput -and $customInput.Trim())
+    }
 
     # ----- Summary -----
     Write-Section "SELECTED CONFIGURATION"
@@ -1448,9 +1575,12 @@ function Main {
     Write-Host "    Scenario:       $scenario" -ForegroundColor White
     Write-Host "    Appliance Type: $applianceType" -ForegroundColor White
     Write-Host "    Private Link:   $privateLink" -ForegroundColor White
+    Write-Host "    Output Format:  $($script:OutputFormat)" -ForegroundColor White
     Write-Host ""
-    Write-Host "  Press Enter to begin connectivity checks or Ctrl+C to cancel..." -ForegroundColor Gray
-    Read-Host
+    if ($isInteractive) {
+        Write-Host "  Press Enter to begin connectivity checks or Ctrl+C to cancel..." -ForegroundColor Gray
+        Read-Host
+    }
 
     # ----- Environment Info -----
     Get-EnvironmentInfo
@@ -1496,9 +1626,14 @@ function Main {
     # ----- Recommendations -----
     Write-Recommendations -Cloud $cloud -Scenario $scenario -ApplianceType $applianceType -PrivateLink $privateLink
 
-    # ----- Export Report -----
+    # ----- Export Reports -----
     Export-Report -Cloud $cloud -Scenario $scenario -ApplianceType $applianceType `
         -PrivateLink $privateLink -ProxyDetected $proxyDetected
+
+    if ($script:OutputFormat -eq 'JSON') {
+        Export-JsonReport -Cloud $cloud -Scenario $scenario -ApplianceType $applianceType `
+            -PrivateLink $privateLink -ProxyDetected $proxyDetected
+    }
 
     # ----- Final Banner -----
     Write-Host ""
@@ -1506,6 +1641,9 @@ function Main {
     Write-Host "  Troubleshooting complete. Review results above and in the saved report." -ForegroundColor Cyan
     Write-Host "  If issues persist, share the report with Microsoft Support." -ForegroundColor Cyan
     Write-Host "  Report: $($script:ReportPath)" -ForegroundColor Cyan
+    if ($script:OutputFormat -eq 'JSON') {
+        Write-Host "  JSON:   $($script:JsonReportPath)" -ForegroundColor Cyan
+    }
     Write-Host "===============================================================================" -ForegroundColor Cyan
     Write-Host ""
 }
